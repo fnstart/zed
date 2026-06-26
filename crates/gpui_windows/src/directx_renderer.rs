@@ -1587,10 +1587,10 @@ pub(crate) mod shader_resources {
     #[cfg(debug_assertions)]
     use windows::{
         Win32::Graphics::Direct3D::{
-            Fxc::{D3DCOMPILE_DEBUG, D3DCOMPILE_SKIP_OPTIMIZATION, D3DCompileFromFile},
+            Fxc::{D3DCOMPILE_DEBUG, D3DCOMPILE_SKIP_OPTIMIZATION, D3DCompile},
             ID3DBlob,
         },
-        core::{HSTRING, PCSTR},
+        core::PCSTR,
     };
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1688,16 +1688,47 @@ pub(crate) mod shader_resources {
 
     #[cfg(debug_assertions)]
     pub(super) fn build_shader_blob(entry: ShaderModule, target: ShaderTarget) -> Result<ID3DBlob> {
+        // Embed the .hlsl sources at COMPILE time so shader init never touches the
+        // filesystem at runtime. The original D3DCompileFromFile path read
+        // CARGO_MANIFEST_DIR/src/<shader>.hlsl at runtime — that env! is the build
+        // host's path and is absent on the Windows target, so canonicalize() failed
+        // with os error 3, propagating up to the panic at gpui_platform.rs:46.
+        //
+        // Both shaders #include "alpha_correction.hlsl" (line 1), and
+        // alpha_correction.hlsl has no nested includes. So we concatenate the
+        // embedded alpha_correction bytes with the shader body (with its line-1
+        // include stripped) and pass pInclude = None — no ID3DInclude callback
+        // needed. Textually equivalent to the preprocessor's #include expansion.
         unsafe {
-            use windows::Win32::Graphics::{
-                Direct3D::ID3DInclude, Hlsl::D3D_COMPILE_STANDARD_FILE_INCLUDE,
-            };
-
             let shader_name = if matches!(entry, ShaderModule::EmojiRasterization) {
                 "color_text_raster.hlsl"
             } else {
                 "shaders.hlsl"
             };
+
+            // Compile-time embedding. include_str! resolves relative to this source
+            // file at compile time on the build host; the bytes are baked into the
+            // binary as &'static str. No runtime file access.
+            let alpha_correction: &str = include_str!("alpha_correction.hlsl");
+            let shader_body: &str = if matches!(entry, ShaderModule::EmojiRasterization) {
+                include_str!("color_text_raster.hlsl")
+            } else {
+                include_str!("shaders.hlsl")
+            };
+            // Strip the leading `#include "alpha_correction.hlsl"\n` from the shader
+            // body (it's line 1 of both files — verified). We then prepend the
+            // alpha_correction content, reproducing the preprocessor's expansion.
+            // The assert turns a wrong assumption into a loud build-time failure at
+            // the exact line (showing the actual content) instead of a confusing
+            // downstream "missing entry point" shader error from an empty body.
+            let (first_line, body) = shader_body
+                .split_once('\n')
+                .expect("shader file has no newline; expected #include on line 1");
+            assert!(
+                first_line.trim_end_matches('\r').trim() == r#"#include "alpha_correction.hlsl""#,
+                "expected line 1 of {shader_name} to be the alpha_correction #include, got: {first_line:?}"
+            );
+            let shader_source = format!("{alpha_correction}\n{body}");
 
             let entry = format!(
                 "{}_{}\0",
@@ -1712,24 +1743,29 @@ pub(crate) mod shader_resources {
                 ShaderTarget::Fragment => "ps_4_1\0",
             };
 
-            let mut compile_blob = None;
-            let mut error_blob = None;
-            let shader_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join(&format!("src/{}", shader_name))
-                .canonicalize()?;
-
+            // Bind the CString to a local that outlives the D3DCompile call
+            // (entry/target are already bound this way — only source_name was the UAF).
+            // CString::as_ptr() yields *const c_char (i8 on this target); PCSTR wants
+            // *const u8, so cast. The pointer is valid for the CString's lifetime.
+            let source_name_cstr = std::ffi::CString::new(shader_name).unwrap();
+            let source_name = PCSTR::from_raw(source_name_cstr.as_ptr() as *const u8);
             let entry_point = PCSTR::from_raw(entry.as_ptr());
             let target_cstr = PCSTR::from_raw(target.as_ptr());
 
-            // really dirty trick because winapi bindings are unhappy otherwise
-            let include_handler = &std::mem::transmute::<usize, ID3DInclude>(
-                D3D_COMPILE_STANDARD_FILE_INCLUDE as usize,
-            );
+            let mut compile_blob = None;
+            let mut error_blob = None;
 
-            let ret = D3DCompileFromFile(
-                &HSTRING::from(shader_path.to_str().unwrap()),
+            // D3DCompile (in-memory) — entrypoint, target profile, flags match the old
+            // D3DCompileFromFile call exactly. pInclude = None: the #include is
+            // resolved at compile time via the concat above. psourcename is the
+            // shader filename for diagnostics (a filename-only string is sufficient
+            // and avoids baking the host path into the binary).
+            let ret = D3DCompile(
+                shader_source.as_ptr() as *const _,
+                shader_source.len(),
+                source_name,
                 None,
-                include_handler,
+                None,
                 entry_point,
                 target_cstr,
                 D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION,
